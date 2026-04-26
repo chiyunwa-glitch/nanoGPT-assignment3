@@ -48,6 +48,25 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        self.use_rope = config.use_rope
+        if config.use_rope:
+            head_dim = config.n_embd // config.n_head
+            assert head_dim % 2 == 0, f"head_dim ({head_dim}) must be even for RoPE"
+            half = head_dim // 2
+            # θ_i = 1 / 10000^(2i / head_dim), i in [0, half)  — Su et al. 2021, https://arxiv.org/abs/2104.09864
+            theta = 1.0 / (10000.0 ** (torch.arange(0, half).float() / half))
+            freqs = torch.outer(torch.arange(config.block_size).float(), theta)  # (block_size, half)
+            self.register_buffer('rope_cos', freqs.cos())  # (block_size, half)
+            self.register_buffer('rope_sin', freqs.sin())  # (block_size, half)
+
+    def _apply_rope(self, x, T):
+        # halved convention: rotate first half of head_dim against second half
+        # x: (B, nh, T, hs)
+        half = x.size(-1) // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        cos = self.rope_cos[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, half)
+        sin = self.rope_sin[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, half)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -57,6 +76,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        if self.use_rope:
+            q = self._apply_rope(q, T)
+            k = self._apply_rope(k, T)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -131,6 +154,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     activation: str = 'gelu'  # 'gelu', 'relu', or 'gelu_scratch'
+    use_rope: bool = False  # replace learned absolute wpe with Rotary Position Embeddings (Su et al. 2021)
 
 class GPT(nn.Module):
 
@@ -140,13 +164,15 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
+        transformer_dict = dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        )
+        if not config.use_rope:
+            transformer_dict['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+        self.transformer = nn.ModuleDict(transformer_dict)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -172,7 +198,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and not self.config.use_rope:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -188,12 +214,14 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.use_rope:
+            x = self.transformer.drop(tok_emb)  # position encoded via RoPE inside attention
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -215,10 +243,14 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if not self.config.use_rope:
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+            if self.config.use_rope:
+                block.attn.rope_cos = block.attn.rope_cos[:block_size]
+                block.attn.rope_sin = block.attn.rope_sin[:block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):

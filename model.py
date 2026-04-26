@@ -130,6 +130,65 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class Expert(nn.Module):
+    """Single MoE expert: c_fc -> activation -> c_proj, no dropout (applied once on SparseMoE output)."""
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        if config.activation == 'relu':
+            self.act = nn.ReLU()
+        elif config.activation == 'gelu_scratch':
+            self.act = GELUFromScratch()
+        elif config.activation == 'gelu':
+            self.act = nn.GELU()  # Hendrycks & Gimpel 2016, https://arxiv.org/abs/1606.08415
+        else:
+            raise ValueError(f"Unknown activation '{config.activation}'. Expected one of: 'gelu', 'relu', 'gelu_scratch'.")
+
+    def forward(self, x):
+        return self.c_proj(self.act(self.c_fc(x)))
+
+class SparseMoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.moe_top_k
+        self.experts = nn.ModuleList([Expert(config) for _ in range(config.num_experts)])
+        self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.view(B * T, C)  # treat every token position independently
+
+        router_logits = self.router(x_flat)                              # (N, num_experts)
+        probs = torch.softmax(router_logits, dim=-1)                     # (N, num_experts)
+        top_k_probs, top_k_idx = torch.topk(probs, self.top_k, dim=-1)  # (N, k)
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)  # re-normalize
+
+        out = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            slot_masks = (top_k_idx == i)                            # (N, k) bool
+            token_mask = slot_masks.any(dim=-1)                      # (N,) which tokens use expert i
+            if not token_mask.any():
+                continue
+            token_indices = token_mask.nonzero(as_tuple=True)[0]     # (n_i,) flat indices
+            weights = (slot_masks * top_k_probs).sum(dim=-1)         # (N,) weight, 0 if unselected
+            expert_out = expert(x_flat[token_indices])               # (n_i, C)
+            out.index_add_(0, token_indices, weights[token_indices].unsqueeze(-1) * expert_out)
+
+        # Switch Transformer load-balancing loss: num_experts * sum(f_i * P_i)
+        # f_i — fraction of tokens hard-routed to expert i (non-differentiable)
+        # P_i — mean router softmax probability for expert i (differentiable)
+        N = B * T
+        expert_mask = torch.zeros(N, self.num_experts, device=x.device)
+        expert_mask.scatter_add_(1, top_k_idx, torch.ones_like(top_k_idx, dtype=torch.float))
+        f = expert_mask.mean(dim=0)  # (num_experts,)
+        P = probs.mean(dim=0)        # (num_experts,)
+        aux_loss = self.num_experts * (f * P).sum()
+
+        return self.dropout(out.view(B, T, C)), aux_loss
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -137,11 +196,17 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.use_moe = config.use_moe
+        self.mlp = SparseMoE(config) if config.use_moe else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        if self.use_moe:
+            mlp_out, self.last_aux_loss = self.mlp(self.ln_2(x))
+        else:
+            mlp_out = self.mlp(self.ln_2(x))
+            self.last_aux_loss = 0.0
+        x = x + mlp_out
         return x
 
 @dataclass
@@ -155,6 +220,10 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     activation: str = 'gelu'  # 'gelu', 'relu', or 'gelu_scratch'
     use_rope: bool = False  # replace learned absolute wpe with Rotary Position Embeddings (Su et al. 2021)
+    use_moe: bool = False        # replace MLP sub-layer with Sparse Mixture of Experts
+    num_experts: int = 4         # total number of experts per MoE layer
+    moe_top_k: int = 2           # experts activated per token
+    moe_aux_loss_coef: float = 0.01  # weight for load-balancing auxiliary loss
 
 class GPT(nn.Module):
 
@@ -230,6 +299,9 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if self.config.use_moe:
+                aux = sum(b.last_aux_loss for b in self.transformer.h)
+                loss = loss + self.config.moe_aux_loss_coef * aux
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -278,6 +350,8 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
+        assert not config.use_moe, \
+            "Cannot load pretrained GPT-2 weights into a MoE model; weight shapes are incompatible."
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()

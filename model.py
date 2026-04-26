@@ -75,18 +75,34 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class GELUFromScratch(nn.Module):
+    """
+    GELU activation function from Hendrycks & Gimpel 2016 (https://arxiv.org/abs/1606.08415).
+    Exact formula: 0.5 * x * (1 + erf(x / sqrt(2))).
+    Not used by default (nn.GELU is faster); select via activation='gelu_scratch' in GPTConfig.
+    """
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
+        if config.activation == 'relu':
+            self.act = nn.ReLU()
+        elif config.activation == 'gelu_scratch':
+            self.act = GELUFromScratch()
+        elif config.activation == 'gelu':
+            self.act = nn.GELU()  # Hendrycks & Gimpel 2016, https://arxiv.org/abs/1606.08415
+        else:
+            raise ValueError(f"Unknown activation '{config.activation}'. Expected one of: 'gelu', 'relu', 'gelu_scratch'.")
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = self.act(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -114,6 +130,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    activation: str = 'gelu'  # 'gelu', 'relu', or 'gelu_scratch'
 
 class GPT(nn.Module):
 

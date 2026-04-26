@@ -232,3 +232,147 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 ## acknowledgements
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+## Architecture Extensions
+
+### GELU — Gaussian Error Linear Units (Hendrycks & Gimpel, [2016](https://arxiv.org/abs/1606.08415))
+
+**Core idea:** GELU is "ReLU, but smooth." Where ReLU hard-cuts every negative input to zero, GELU multiplies each input by the probability that a standard normal random variable falls below it — so small negatives leak through, large negatives still get killed, but the transition is smooth instead of a sharp corner.
+
+**What it does:** Replaces the activation function inside the MLP block. The smooth, differentiable curve gives gradients a cleaner signal to flow through during training, which is why most modern transformers (GPT-2 onward, BERT, T5) use GELU over ReLU. The exact formula is 0.5 · x · (1 + erf(x/√2)).
+
+**Key design choices in this implementation:**
+- The activation is pluggable via `config.activation` and applies uniformly to both the standard `MLP` and the `Expert` class inside the MoE layer — one setting controls all MLP-style blocks.
+- Three options are supported: `nn.GELU` (default, uses PyTorch's optimised kernel), a `GELUFromScratch` class that implements the exact `0.5 * x * (1 + erf(x / sqrt(2)))` formula via `torch.erf` (not the tanh approximation used in some frameworks), and `nn.ReLU` for ablation comparisons.
+- An unrecognised activation string raises `ValueError` with the valid options listed — silent fallback would hide config typos.
+
+**Config flags:**
+```python
+activation: str = 'gelu'   # 'gelu' | 'relu' | 'gelu_scratch'
+```
+
+**Usage:**
+```python
+from model import GPTConfig, GPT
+
+# Default — nn.GELU (fastest, recommended)
+model = GPT(GPTConfig(activation='gelu'))
+
+# Exact erf formula, pedagogical — numerically identical to nn.GELU
+model = GPT(GPTConfig(activation='gelu_scratch'))
+
+# ReLU — for ablation
+model = GPT(GPTConfig(activation='relu'))
+```
+
+### RoPE — Rotary Position Embeddings (Su et al., [2021](https://arxiv.org/abs/2104.09864))
+
+**Core idea:** Instead of *adding* a position vector to the input embedding once at the start, RoPE *rotates* each query and key vector inside attention by an angle that depends on its position. By construction, the dot product Q·Kᵀ between a query at position m and a key at position n depends only on the relative offset m − n, not the absolute positions. So the model gets relative-position awareness for free, with no learned position parameters.
+
+**What it does:** Replaces nanoGPT's learned absolute position embeddings (`wpe`) with a precomputed rotation applied to Q and K inside `CausalSelfAttention`. The rotation is parameter-free — just fixed cos/sin tables computed from a base frequency θ. Modern LLMs (Llama, Mistral, Qwen, GPT-NeoX) all use RoPE for this reason.
+
+**Key design choices in this implementation:**
+- **Halved-pair convention:** the rotation splits each head vector into first-half and second-half and rotates them against each other — `[x1·cos − x2·sin, x1·sin + x2·cos]`. This matches the Llama/HuggingFace/GPT-NeoX convention. The original paper instead rotates adjacent pairs `(x₀,x₁), (x₂,x₃), ...`; the two are mathematically equivalent under a reordering of dimensions but the halved form is now the de-facto standard.
+- **Base frequency hardcoded to 10000.0** in `CausalSelfAttention.__init__`, matching GPT-NeoX and the original paper. To use Llama-3's 500000.0 or any other value, edit the constant there directly — it is not exposed as a config field.
+- **Registered buffers, not parameters:** `rope_cos` and `rope_sin` are stored via `register_buffer`, so they travel with the model on `.to(device)` but are excluded from `optimizer.param_groups` and saved state dicts without gradients.
+- **`wpe` is removed entirely** when `use_rope=True` — the `nn.Embedding` for absolute positions is not added to the `transformer` ModuleDict, saving `block_size × n_embd` parameters.
+- **Defensive guards:** `head_dim` must be even (asserted at init time); `crop_block_size` trims `rope_cos` and `rope_sin` alongside the causal mask so context-length surgery stays consistent; `from_pretrained` is safe by construction — it always builds a fresh `GPTConfig` with `use_rope=False` and constrains `override_args` to `dropout` only.
+- **`use_rope=False` is bit-identical to the original** — the wpe path is unchanged and no code runs in the attention forward unless the flag is set.
+
+**Config flags:**
+```python
+use_rope: bool = False   # True replaces wpe with RoPE; head_dim must be even
+```
+
+**Usage:**
+```python
+from model import GPTConfig, GPT
+
+# Train from scratch with RoPE (no learned position embeddings)
+model = GPT(GPTConfig(use_rope=True, n_embd=64, n_head=2))  # head_dim=32, even ✓
+
+# Load pretrained GPT-2, then fine-tune with original absolute embeddings (use_rope=False)
+model = GPT.from_pretrained('gpt2')   # always use_rope=False; safe by default
+```
+
+### MoE — Mixture of Experts (Switch Transformer / Mixtral; HuggingFace [blog](https://huggingface.co/blog/moe))
+
+**Core idea:** Replace one MLP block with N independent expert MLPs and a small router that picks which experts each token visits. Each token only activates *k* of the *N* experts (e.g., 2 of 4), so total parameters grow with N but per-token compute stays roughly constant. Different experts can specialize in different patterns — punctuation, code, named entities — without any of them being forced to handle everything.
+
+**What it does:** Replaces the `MLP` sub-layer in each transformer block with a `SparseMoE` module containing 4 experts and a top-2 softmax router. A load-balancing auxiliary loss (Switch Transformer style) is added to the training objective to keep the router from collapsing onto one or two favorite experts. The aux loss is plumbed up through `Block.last_aux_loss` and folded into the cross-entropy loss inside `GPT.forward`, so the training loop in `train.py` needs no changes.
+
+**Key design choices in this implementation:**
+- **4 experts, top-2 routing** — each token's output is the weighted sum of 2 expert outputs, with weights re-normalised from the top-2 softmax probabilities. This follows Mixtral rather than Switch Transformer's k=1; k=2 is more stable because the gradient path through the router is never a single hard choice.
+- **Simple softmax router, no noisy gating** — router logits go straight to softmax with no added noise. Noisy top-k (GShard-style) adds training complexity; the aux loss alone is sufficient to prevent collapse at this scale.
+- **Load-balancing aux loss:** `num_experts · Σ(fᵢ · Pᵢ)`, where `fᵢ` is the fraction of tokens hard-routed to expert i (computed from the discrete top-k mask — non-differentiable) and `Pᵢ` is the mean router softmax probability for expert i (differentiable, the gradient path). Multiplying the two pushes both the selection counts and the probabilities toward uniformity. Weighted by `moe_aux_loss_coef` (default 0.01) before being added to cross-entropy.
+- **Stripped `Expert` class with no internal dropout** — each expert is `c_fc → activation → c_proj` only. A single `nn.Dropout` is applied once on the combined MoE output, avoiding double-dropout that would occur with k=2 if each expert had its own.
+- **Expert dispatch is a Python loop** over `num_experts`, using `index_add_` to scatter weighted outputs back into a result tensor. `index_add_` gives well-defined gradient accumulation across PyTorch versions; the simpler boolean-index `+=` has inconsistent behaviour. Batched dispatch is a production optimisation not needed at this scale.
+- **Aux loss surfaced via `Block.last_aux_loss`** — the attribute is written by `Block.forward` after each MoE call and read by `GPT.forward` after the block loop. This keeps `Block.forward`'s return type as just `x` and leaves `train.py` completely unchanged.
+- **`config.activation` cascades into experts** — the same `'gelu'` / `'relu'` / `'gelu_scratch'` flag used for the standard MLP is respected inside each `Expert`, so activation choice is consistent across the whole model.
+- **`from_pretrained` guard** — loading GPT-2 weights into a MoE model is blocked by an explicit `assert not config.use_moe` after the config is constructed, since the weight shapes are incompatible.
+
+**Config flags:**
+```python
+use_moe: bool = False            # replace MLP with SparseMoE in every block
+num_experts: int = 4             # total experts per layer
+moe_top_k: int = 2              # experts activated per token
+moe_aux_loss_coef: float = 0.01  # weight of load-balancing loss added to CE
+```
+
+**Usage:**
+```python
+from model import GPTConfig, GPT
+
+# MoE model — 4 experts, top-2 routing
+cfg = GPTConfig(use_moe=True, num_experts=4, moe_top_k=2, moe_aux_loss_coef=0.01)
+model = GPT(cfg)
+
+# Forward pass with targets: returned loss already includes aux contribution
+logits, loss = model(x, targets=y)   # loss = CE + 0.01 * load_balance_aux
+loss.backward()                       # train.py needs no changes
+```
+
+### LoRA — Low-Rank Adaptation (Hu et al., [2021](https://arxiv.org/abs/2106.09685))
+
+**Core idea:** During fine-tuning, you don't need to update *every* weight in a giant matrix W. The actual update ΔW that adapts a pretrained model to a new task tends to live in a tiny subspace — it's *low rank*. So instead of training ΔW directly (millions of parameters), LoRA trains a low-rank factorization ΔW ≈ B·A where A and B are skinny matrices of rank r ≪ min(d_in, d_out). The base weight W stays frozen; only A and B are learned. For our default rank-8 attention LoRA on GPT-2 base, this works out to **442,368 trainable parameters out of 124,882,176 total — just 0.35%**.
+
+**What it does:** Wraps targeted `nn.Linear` layers in a `LoRALinear` adapter that adds a small trainable update on the side: `y = W·x + (α/r) · B(A(x))`. The base weight is frozen on wrap; only A and B carry gradient. A is initialized with Kaiming uniform (standard linear init) but B is initialized to **zero** — so at step 0, B·A = 0 and the model's output is bit-identical to the pretrained base. Training perturbs B away from zero only as the task demands.
+
+**Key design choices in this implementation:**
+- **Default targets are `attn.c_attn` and `attn.c_proj`** — the fused QKV projection and attention output projection, matching the paper's recommendation. MLP layers and `lm_head` are not targeted by default; `lm_head` is intentionally excluded because it shares weights with `wte` via weight tying.
+- **Path-suffix matching** in `apply_lora` disambiguates `attn.c_proj` from `mlp.c_proj` — both layers are named `c_proj`, so matching on the full dotted suffix rather than just the leaf name is necessary to target attention only.
+- **Two-call forward** — `x → F.linear(x, lora_A) → F.linear(..., lora_B)` — rather than materialising `lora_B @ lora_A` first. Peak intermediate memory is O(r) not O(d_in · d_out); at rank 8 on GPT-2's 768-dim layers that is a 96× reduction in the intermediate allocation.
+- **Zero-init of B verified at runtime:** running a forward pass immediately after `apply_lora` on a freshly constructed model produces max absolute diff of `0.00` versus the unwrapped model, confirming the adapter is a true no-op at initialisation.
+- **`apply_lora` asserts every target was matched** — if a name in `lora_target_modules` matches nothing, an `AssertionError` is raised listing all available linear layer paths. A silent no-op from a typo would otherwise train zero LoRA parameters with no warning.
+- **`freeze_non_lora` prints the trainable breakdown** in the format `LoRA: {trainable:,} trainable / {total:,} total ({pct:.2f}%)` immediately after freezing, so the parameter budget is always visible at the start of a fine-tuning run.
+- **`save_lora_only` / `load_lora` for tiny adapter checkpoints** — `save_lora_only` filters the state dict to only `lora_A` and `lora_B` keys, producing a file at KB scale rather than hundreds of MB for a full GPT-2 checkpoint. `load_lora` restores these into a model that already has `LoRALinear` layers applied, using `strict=False` and asserting that no LoRA keys are missing or unexpected.
+- **`apply_lora` is an explicit separate step**, not auto-triggered by `config.use_lora` inside `GPT.__init__`. This preserves the natural fine-tuning workflow and avoids entangling weight loading with adapter insertion.
+- **Composes cleanly with MoE** — because the default targets only cover attention projections, `apply_lora` does not wrap `Expert` layers inside a `SparseMoE` block. Both features can be enabled together without conflict.
+
+**Config flags:**
+```python
+use_lora: bool = False                                        # informational; apply_lora() does the actual wrapping
+lora_rank: int = 8                                            # rank r of A and B matrices
+lora_alpha: float = 16.0                                      # scale factor: delta weighted by alpha/rank
+lora_target_modules: tuple = ('attn.c_attn', 'attn.c_proj')  # path-suffixes of linears to wrap
+```
+
+**Usage:**
+```python
+from model import GPTConfig, GPT, apply_lora, freeze_non_lora, save_lora_only, load_lora
+
+# Full fine-tuning workflow
+model = GPT.from_pretrained('gpt2')                 # load pretrained base
+cfg = GPTConfig(lora_rank=8, lora_alpha=16.0)
+apply_lora(model, cfg)                              # graft LoRA adapters in-place
+freeze_non_lora(model)                              # prints: LoRA: 442,368 / 124,882,176 (0.35%)
+# ... fine-tune with your training loop (train.py unchanged) ...
+
+# Save only the tiny adapter (KB, not MB)
+save_lora_only(model, 'lora_adapter.pt')
+
+# Restore: load base fresh, apply structure, load adapter weights
+model2 = GPT.from_pretrained('gpt2')
+apply_lora(model2, cfg)
+load_lora(model2, 'lora_adapter.pt')
+```

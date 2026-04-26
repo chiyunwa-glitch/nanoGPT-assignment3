@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
+import os
 from dataclasses import dataclass
 
 import torch
@@ -189,6 +190,28 @@ class SparseMoE(nn.Module):
 
         return self.dropout(out.view(B, T, C)), aux_loss
 
+class LoRALinear(nn.Module):
+    """
+    LoRA (Low-Rank Adaptation) wrapper for nn.Linear.
+    Adds trainable A (r × in) and B (out × r) matrices alongside frozen base weights.
+    Forward: base(x) + (alpha/rank) * F.linear(F.linear(x, lora_A), lora_B)
+    Two F.linear calls avoid materializing the full (out × in) delta matrix.
+    B is zero-initialized so the LoRA delta is exactly zero at step 0.
+    Reference: Hu et al. 2021, https://arxiv.org/abs/2106.09685
+    """
+    def __init__(self, linear: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.linear = linear
+        self.scale = alpha / rank
+        self.lora_A = nn.Parameter(torch.empty(rank, linear.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(linear.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        for param in self.linear.parameters():
+            param.requires_grad = False  # freeze base weights on wrapping
+
+    def forward(self, x):
+        return self.linear(x) + self.scale * F.linear(F.linear(x, self.lora_A), self.lora_B)
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -224,6 +247,10 @@ class GPTConfig:
     num_experts: int = 4         # total number of experts per MoE layer
     moe_top_k: int = 2           # experts activated per token
     moe_aux_loss_coef: float = 0.01  # weight for load-balancing auxiliary loss
+    use_lora: bool = False                                        # enable LoRA fine-tuning adapters
+    lora_rank: int = 8                                            # rank r of the A and B matrices
+    lora_alpha: float = 16.0                                      # LoRA scaling: delta weighted by alpha/rank
+    lora_target_modules: tuple = ('attn.c_attn', 'attn.c_proj')  # path-suffix of linears to wrap
 
 class GPT(nn.Module):
 
@@ -451,3 +478,74 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+def apply_lora(model, config):
+    """
+    Replace nn.Linear layers whose dotted module path ends with a string in
+    config.lora_target_modules with LoRALinear wrappers. Raises AssertionError
+    if any target string matches nothing — silent no-ops from typos are a footgun.
+    Note: lm_head shares weights with wte; avoid adding lm_head to lora_target_modules.
+    """
+    found = {t: False for t in config.lora_target_modules}
+    replacements = []  # collect before iterating to avoid mutating the module tree mid-walk
+
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        matched = [t for t in config.lora_target_modules if name.endswith(t)]
+        if matched:
+            for t in matched:
+                found[t] = True
+            replacements.append((name, module))
+
+    for name, module in replacements:
+        parts = name.split('.')
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], LoRALinear(module, config.lora_rank, config.lora_alpha))
+
+    missing = [t for t, ok in found.items() if not ok]
+    assert not missing, (
+        f"LoRA target(s) {missing} not found in model. "
+        f"Available linear layers: {[n for n, m in model.named_modules() if isinstance(m, nn.Linear)]}"
+    )
+    return model
+
+
+def freeze_non_lora(model):
+    """Freeze all parameters except LoRA A and B matrices, then report the trainable ratio."""
+    for name, param in model.named_parameters():
+        if 'lora_A' not in name and 'lora_B' not in name:
+            param.requires_grad = False
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"LoRA: {trainable:,} trainable / {total:,} total ({100 * trainable / total:.2f}%)")
+
+
+def save_lora_only(model, path):
+    """
+    Save only lora_A and lora_B tensors. The resulting file is kilobytes rather than
+    hundreds of megabytes. Pair with load_lora to restore into a fresh base model.
+    """
+    lora_state = {k: v for k, v in model.state_dict().items()
+                  if 'lora_A' in k or 'lora_B' in k}
+    assert lora_state, "No LoRA parameters found; call apply_lora before save_lora_only."
+    torch.save(lora_state, path)
+    size_kb = os.path.getsize(path) / 1024
+    print(f"Saved {len(lora_state)} LoRA tensors to {path} ({size_kb:.1f} KB)")
+
+
+def load_lora(model, path):
+    """
+    Load a LoRA-only checkpoint into a model that already has LoRALinear layers applied.
+    The base weights must be loaded separately (e.g. via GPT.from_pretrained).
+    """
+    lora_state = torch.load(path, map_location='cpu')
+    missing, unexpected = model.load_state_dict(lora_state, strict=False)
+    assert not unexpected, f"Unexpected keys in LoRA checkpoint: {unexpected}"
+    missing_lora = [k for k in missing if 'lora_A' in k or 'lora_B' in k]
+    assert not missing_lora, f"LoRA keys missing from checkpoint: {missing_lora}"
+    print(f"Loaded {len(lora_state)} LoRA tensors from {path}")
+    return model

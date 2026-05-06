@@ -94,7 +94,7 @@ queries dot against the already-rotated keys.
 
 ### 3. Mixture of Experts (MoE)
 
-Source: Hugging Face blog, [https://huggingface.co/blog/moe](https://huggingface.co/blog/moe).
+Source: Hugging Face blog, [https://huggingface.co/blog/moe#a-brief-history-of-moes](https://huggingface.co/blog/moe#a-brief-history-of-moes).
 
 **Underlying idea.** A dense MLP forces every token through the same set of
 weights. MoE replaces it with `N` independent expert MLPs and a small *router*

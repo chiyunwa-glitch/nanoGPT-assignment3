@@ -80,8 +80,21 @@ head_dim = n_embd // n_head # derived dimension of each head
 
 # Architecture extensions (Assignment 3)
 USE_GELU = True # GELU activation in the MLP (Hendrycks & Gimpel 2016, arxiv:1606.08415)
+USE_ROPE = True # Rotary position embeddings on Q,K (Su et al. 2021, arxiv:2104.09864)
+ROPE_BASE = 10000.0 # base period theta_0; matches the original RoPE paper
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+state_dict = {'wte': matrix(vocab_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+if not USE_ROPE:
+    # Absolute learned position embeddings; skipped when RoPE supplies position info inside attention.
+    state_dict['wpe'] = matrix(block_size, n_embd)
+else:
+    # RoPE rotation tables (Su et al. 2021, eq. 14-15). These are constants, not parameters:
+    # angle(pos, i) = pos * theta_i,  theta_i = base^(-2i / head_dim) for i in [0, head_dim/2).
+    assert head_dim % 2 == 0, f"head_dim ({head_dim}) must be even for RoPE"
+    _half = head_dim // 2
+    _inv_freq = [1.0 / (ROPE_BASE ** (2 * i / head_dim)) for i in range(_half)]
+    ROPE_COS = [[math.cos(pos * f) for f in _inv_freq] for pos in range(block_size)]
+    ROPE_SIN = [[math.sin(pos * f) for f in _inv_freq] for pos in range(block_size)]
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
@@ -109,6 +122,22 @@ def rmsnorm(x):
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
 
+def apply_rope(vec, pos):
+    # Rotary position embedding for one head vector at one position (Su et al. 2021, eq. 15).
+    # We use the original adjacent-pair convention: split vec into pairs (vec[2i], vec[2i+1])
+    # and rotate each pair by angle pos * theta_i. cos/sin tables are precomputed as
+    # plain Python floats, so they enter the autograd graph through Value.__rmul__ /
+    # __sub__ / __add__ as numerical scalars (no extra trainable parameters).
+    cos_row = ROPE_COS[pos]
+    sin_row = ROPE_SIN[pos]
+    out = []
+    for i in range(len(vec) // 2):
+        x_even, x_odd = vec[2*i], vec[2*i + 1]
+        c, s = cos_row[i], sin_row[i]
+        out.append(x_even * c - x_odd * s)
+        out.append(x_even * s + x_odd * c)
+    return out
+
 def gelu(x):
     # GELU, tanh approximation from Hendrycks & Gimpel 2016 (arxiv:1606.08415, eq. 2):
     #   GELU(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
@@ -126,8 +155,11 @@ def gelu(x):
 
 def gpt(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
-    pos_emb = state_dict['wpe'][pos_id] # position embedding
-    x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
+    if USE_ROPE:
+        x = list(tok_emb) # RoPE injects position info inside attention; no additive pos embedding here
+    else:
+        pos_emb = state_dict['wpe'][pos_id] # absolute learned position embedding
+        x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
     x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
 
     for li in range(n_layer):
@@ -137,6 +169,16 @@ def gpt(token_id, pos_id, keys, values):
         q = linear(x, state_dict[f'layer{li}.attn_wq'])
         k = linear(x, state_dict[f'layer{li}.attn_wk'])
         v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        if USE_ROPE:
+            # Rotate Q and K per head at position pos_id before caching, so cached K's
+            # already carry their own positions. The Q.K dot product then depends only on
+            # relative offset (m-n), per Su et al. 2021 Theorem 1.
+            q_rot, k_rot = [], []
+            for h in range(n_head):
+                hs = h * head_dim
+                q_rot.extend(apply_rope(q[hs:hs+head_dim], pos_id))
+                k_rot.extend(apply_rope(k[hs:hs+head_dim], pos_id))
+            q, k = q_rot, k_rot
         keys[li].append(k)
         values[li].append(v)
         x_attn = []

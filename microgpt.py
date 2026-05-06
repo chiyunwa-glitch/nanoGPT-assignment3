@@ -77,6 +77,9 @@ n_embd = 16     # width of the network (embedding dimension)
 block_size = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
 n_head = 4      # number of attention heads
 head_dim = n_embd // n_head # derived dimension of each head
+
+# Architecture extensions (Assignment 3)
+USE_GELU = True # GELU activation in the MLP (Hendrycks & Gimpel 2016, arxiv:1606.08415)
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 for i in range(n_layer):
@@ -90,7 +93,8 @@ params = [p for mat in state_dict.values() for row in mat for p in row] # flatte
 print(f"num params: {len(params)}")
 
 # Define the model architecture: a function mapping tokens and parameters to logits over what comes next
-# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
+# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases.
+# (Original microgpt used ReLU in the MLP; with USE_GELU=True we restore the GPT-2 / BERT GELU activation.)
 def linear(x, w):
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
@@ -104,6 +108,21 @@ def rmsnorm(x):
     ms = sum(xi * xi for xi in x) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
+
+def gelu(x):
+    # GELU, tanh approximation from Hendrycks & Gimpel 2016 (arxiv:1606.08415, eq. 2):
+    #   GELU(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
+    # The Value autograd has exp() but no native tanh, so we expand
+    # tanh(u) = (e^u - e^-u) / (e^u + e^-u). The chain rule then flows through exp.
+    k = math.sqrt(2.0 / math.pi)
+    out = []
+    for xi in x:
+        u = k * (xi + 0.044715 * xi**3)
+        e_pos = u.exp()
+        e_neg = (-u).exp()
+        tanh_u = (e_pos - e_neg) / (e_pos + e_neg)
+        out.append(0.5 * xi * (1.0 + tanh_u))
+    return out
 
 def gpt(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
@@ -136,7 +155,7 @@ def gpt(token_id, pos_id, keys, values):
         x_residual = x
         x = rmsnorm(x)
         x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
+        x = gelu(x) if USE_GELU else [xi.relu() for xi in x]
         x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
         x = [a + b for a, b in zip(x, x_residual)]
 

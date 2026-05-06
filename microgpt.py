@@ -82,6 +82,10 @@ head_dim = n_embd // n_head # derived dimension of each head
 USE_GELU = True # GELU activation in the MLP (Hendrycks & Gimpel 2016, arxiv:1606.08415)
 USE_ROPE = True # Rotary position embeddings on Q,K (Su et al. 2021, arxiv:2104.09864)
 ROPE_BASE = 10000.0 # base period theta_0; matches the original RoPE paper
+USE_MOE = False # Sparse Mixture of Experts MLP (HF blog https://huggingface.co/blog/moe)
+NUM_EXPERTS = 4 # number of experts when USE_MOE is True
+MOE_TOP_K = 2   # experts activated per token; Mixtral-style top-2
+MOE_AUX_COEF = 0.01 # weight of the load-balancing aux loss added to CE
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {'wte': matrix(vocab_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 if not USE_ROPE:
@@ -100,8 +104,15 @@ for i in range(n_layer):
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+    if USE_MOE:
+        # Router picks experts; each expert is its own (fc1, fc2) MLP.
+        state_dict[f'layer{i}.moe_router'] = matrix(NUM_EXPERTS, n_embd)
+        for e in range(NUM_EXPERTS):
+            state_dict[f'layer{i}.moe_e{e}_fc1'] = matrix(4 * n_embd, n_embd)
+            state_dict[f'layer{i}.moe_e{e}_fc2'] = matrix(n_embd, 4 * n_embd)
+    else:
+        state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
+        state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
 params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
 
@@ -121,6 +132,74 @@ def rmsnorm(x):
     ms = sum(xi * xi for xi in x) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
+
+# ---- Mixture of Experts -----------------------------------------------------
+# Per https://huggingface.co/blog/moe : a sparse MoE layer replaces a dense MLP
+# with N independent expert MLPs and a small router. Each token visits only the
+# top-k experts the router scores highest, so total params grow with N but
+# per-token compute stays roughly constant. A load-balancing auxiliary loss is
+# added to the training objective to prevent the router from collapsing onto
+# a few favourite experts.
+#
+# microgpt processes one token per gpt() call, so per-token routing stats are
+# accumulated in this module-level dict during a document forward pass and the
+# document-level aux loss is computed once after.
+_moe_stats = None # populated by training loop via reset_moe_stats()
+
+def reset_moe_stats():
+    # Reset at the start of each document so f_i and P_i are document-local.
+    global _moe_stats
+    _moe_stats = {
+        'prob_sum': [Value(0.0) for _ in range(NUM_EXPERTS)], # sum of soft probs per expert (Value)
+        'count':    [0] * NUM_EXPERTS,                        # # tokens that picked expert i (int, hard)
+        'total':    0,                                         # total tokens routed
+    }
+
+def compute_moe_aux_loss():
+    # Switch Transformer-style load-balancing loss (HF blog references this form):
+    #   aux = N * sum_i (f_i * P_i)
+    # f_i = fraction of tokens for which expert i was in top-k (treated as constant w.r.t. params)
+    # P_i = mean router softmax probability for expert i (carries gradients)
+    # At uniform routing, aux = MOE_TOP_K (its lower bound under constant top-k); the gradient
+    # flows through P_i and pushes its mass toward the under-used experts.
+    if _moe_stats is None or _moe_stats['total'] == 0:
+        return Value(0.0)
+    total = _moe_stats['total']
+    f = [c / total for c in _moe_stats['count']]            # plain floats, no grad
+    P = [s / total for s in _moe_stats['prob_sum']]          # Value, has grad
+    return NUM_EXPERTS * sum(f[i] * P[i] for i in range(NUM_EXPERTS))
+
+def moe_block(x, li):
+    # Router logits for this token over NUM_EXPERTS, then softmax.
+    router_logits = linear(x, state_dict[f'layer{li}.moe_router'])
+    router_probs = softmax(router_logits)  # list[Value], len NUM_EXPERTS
+
+    # Hard top-k selection on the router probabilities. The argsort is on .data only,
+    # so the index choice is non-differentiable; the router still learns through P_i in
+    # the aux loss and through the soft re-normalised weights below.
+    chosen = sorted(range(NUM_EXPERTS), key=lambda i: router_probs[i].data, reverse=True)[:MOE_TOP_K]
+
+    # Renormalise the top-k probabilities so they sum to 1 (Mixtral convention).
+    selected = [router_probs[i] for i in chosen]
+    norm = sum(p.data for p in selected) or 1.0
+    weights = [p / norm for p in selected]
+
+    # Run only the chosen experts and combine.
+    out = [Value(0.0) for _ in range(n_embd)]
+    for w, e_id in zip(weights, chosen):
+        h = linear(x, state_dict[f'layer{li}.moe_e{e_id}_fc1'])
+        h = gelu(h) if USE_GELU else [hi.relu() for hi in h]
+        e = linear(h, state_dict[f'layer{li}.moe_e{e_id}_fc2'])
+        out = [o + w * ei for o, ei in zip(out, e)]
+
+    # Tally stats for the document-level aux loss (only during training).
+    if _moe_stats is not None:
+        for i, p in enumerate(router_probs):
+            _moe_stats['prob_sum'][i] = _moe_stats['prob_sum'][i] + p
+        for ci in chosen:
+            _moe_stats['count'][ci] += 1
+        _moe_stats['total'] += 1
+    return out
 
 def apply_rope(vec, pos):
     # Rotary position embedding for one head vector at one position (Su et al. 2021, eq. 15).
@@ -193,12 +272,15 @@ def gpt(token_id, pos_id, keys, values):
             x_attn.extend(head_out)
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
-        # 2) MLP block
+        # 2) MLP block (or sparse MoE block)
         x_residual = x
         x = rmsnorm(x)
-        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = gelu(x) if USE_GELU else [xi.relu() for xi in x]
-        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
+        if USE_MOE:
+            x = moe_block(x, li)
+        else:
+            x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
+            x = gelu(x) if USE_GELU else [xi.relu() for xi in x]
+            x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
         x = [a + b for a, b in zip(x, x_residual)]
 
     logits = linear(x, state_dict['lm_head'])
@@ -220,6 +302,7 @@ for step in range(num_steps):
 
     # Forward the token sequence through the model, building up the computation graph all the way to the loss
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    if USE_MOE: reset_moe_stats() # accumulate per-expert routing stats across this document
     losses = []
     for pos_id in range(n):
         token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
@@ -228,6 +311,8 @@ for step in range(num_steps):
         loss_t = -probs[target_id].log()
         losses.append(loss_t)
     loss = (1 / n) * sum(losses) # final average loss over the document sequence. May yours be low.
+    if USE_MOE: # add load-balancing aux loss so the router doesn't collapse onto a few experts
+        loss = loss + MOE_AUX_COEF * compute_moe_aux_loss()
 
     # Backward the loss, calculating the gradients with respect to all model parameters
     loss.backward()

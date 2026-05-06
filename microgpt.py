@@ -86,6 +86,10 @@ USE_MOE = False # Sparse Mixture of Experts MLP (HF blog https://huggingface.co/
 NUM_EXPERTS = 4 # number of experts when USE_MOE is True
 MOE_TOP_K = 2   # experts activated per token; Mixtral-style top-2
 MOE_AUX_COEF = 0.01 # weight of the load-balancing aux loss added to CE
+USE_LORA = False # Low-Rank Adaptation of attention projections (Hu et al. 2021, arxiv:2106.09685)
+LORA_RANK = 4   # rank r of A and B; trainable update has shape r << n_embd
+LORA_ALPHA = 8.0 # scale: delta weighted by alpha/rank, so effective LR is decoupled from r
+LORA_TARGETS = ('attn_wq', 'attn_wk', 'attn_wv', 'attn_wo') # paper recommends attention projections
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {'wte': matrix(vocab_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 if not USE_ROPE:
@@ -113,8 +117,31 @@ for i in range(n_layer):
     else:
         state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
         state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+    if USE_LORA:
+        # LoRA adapters (Hu et al. 2021): for each target W of shape (n_embd, n_embd) we add
+        # A (rank x n_embd) and B (n_embd x rank). A is gaussian-init, B is exact-zero so the
+        # adapter contributes 0 at step 0 and the base model's behaviour is preserved.
+        for tgt in LORA_TARGETS:
+            state_dict[f'layer{i}.{tgt}_lora_A'] = matrix(LORA_RANK, n_embd)
+            state_dict[f'layer{i}.{tgt}_lora_B'] = [[Value(0.0) for _ in range(LORA_RANK)] for _ in range(n_embd)]
 params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
+
+# Trainable mask: when LoRA is active, only adapter A and B matrices receive Adam updates;
+# every other parameter (wte, lm_head, attention base, MLP/MoE) is frozen — its grad still
+# flows through the autograd graph but the optimizer step skips it.
+if USE_LORA:
+    _lora_ids = set()
+    for k, mat in state_dict.items():
+        if k.endswith('_lora_A') or k.endswith('_lora_B'):
+            for row in mat:
+                for p in row:
+                    _lora_ids.add(id(p))
+    trainable_mask = [id(p) in _lora_ids for p in params]
+    _trainable = sum(trainable_mask)
+    print(f"LoRA: {_trainable} trainable / {len(params)} total ({100*_trainable/len(params):.2f}%)")
+else:
+    trainable_mask = [True] * len(params)
 
 # Define the model architecture: a function mapping tokens and parameters to logits over what comes next
 # Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases.
@@ -132,6 +159,28 @@ def rmsnorm(x):
     ms = sum(xi * xi for xi in x) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
+
+# ---- LoRA -------------------------------------------------------------------
+# Hu et al. 2021 (arxiv:2106.09685): freeze the pretrained weight W and learn a
+# low-rank update delta_W = B @ A, where A is r x in and B is out x r with r
+# much smaller than min(in, out). The forward becomes
+#     y = W x + (alpha / r) * B (A x)
+# A is randomly initialised; B is exact zero, so at step 0 the adapter is a
+# no-op and the model output is bit-identical to the base. As training proceeds,
+# B moves away from zero only as the task demands. The two-call form
+# linear(linear(x, A), B) keeps the intermediate of size r, so peak memory is
+# O(r) rather than O(in*out).
+
+def lora_delta(x, target, li):
+    if not USE_LORA or target not in LORA_TARGETS:
+        return None
+    a = linear(x, state_dict[f'layer{li}.{target}_lora_A'])
+    b = linear(a, state_dict[f'layer{li}.{target}_lora_B'])
+    scale = LORA_ALPHA / LORA_RANK
+    return [scale * bi for bi in b]
+
+def add_delta(y, delta):
+    return y if delta is None else [yi + di for yi, di in zip(y, delta)]
 
 # ---- Mixture of Experts -----------------------------------------------------
 # Per https://huggingface.co/blog/moe : a sparse MoE layer replaces a dense MLP
@@ -245,9 +294,9 @@ def gpt(token_id, pos_id, keys, values):
         # 1) Multi-head Attention block
         x_residual = x
         x = rmsnorm(x)
-        q = linear(x, state_dict[f'layer{li}.attn_wq'])
-        k = linear(x, state_dict[f'layer{li}.attn_wk'])
-        v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        q = add_delta(linear(x, state_dict[f'layer{li}.attn_wq']), lora_delta(x, 'attn_wq', li))
+        k = add_delta(linear(x, state_dict[f'layer{li}.attn_wk']), lora_delta(x, 'attn_wk', li))
+        v = add_delta(linear(x, state_dict[f'layer{li}.attn_wv']), lora_delta(x, 'attn_wv', li))
         if USE_ROPE:
             # Rotate Q and K per head at position pos_id before caching, so cached K's
             # already carry their own positions. The Q.K dot product then depends only on
@@ -270,7 +319,7 @@ def gpt(token_id, pos_id, keys, values):
             attn_weights = softmax(attn_logits)
             head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
             x_attn.extend(head_out)
-        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
+        x = add_delta(linear(x_attn, state_dict[f'layer{li}.attn_wo']), lora_delta(x_attn, 'attn_wo', li))
         x = [a + b for a, b in zip(x, x_residual)]
         # 2) MLP block (or sparse MoE block)
         x_residual = x
@@ -320,6 +369,9 @@ for step in range(num_steps):
     # Adam optimizer update: update the model parameters based on the corresponding gradients
     lr_t = learning_rate * (1 - step / num_steps) # linear learning rate decay
     for i, p in enumerate(params):
+        if not trainable_mask[i]: # frozen by LoRA — zero its grad and skip the update
+            p.grad = 0
+            continue
         m[i] = beta1 * m[i] + (1 - beta1) * p.grad
         v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
         m_hat = m[i] / (1 - beta1 ** (step + 1))
